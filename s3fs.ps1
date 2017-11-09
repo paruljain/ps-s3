@@ -1,7 +1,6 @@
 $ErrorActionPreference = 'stop'
 
 Import-Module .\s3.psm1 -DisableNameChecking
-
 function InferMimeType($Extension) {
     switch ($Extension) {
         '.txt' { 'text/plain'; break }
@@ -38,29 +37,31 @@ function InferMimeType($Extension) {
     }
 }
 
-function Put-File([System.IO.FileSystemInfo]$File, [string]$RemotePath, [string]$Perm='private') {
+function Put-KeyFromFile([string]$File, [string]$RemotePath, [string]$Perm='private') {
+    $f = Get-Item $File
     if (!$RemotePath) { throw 'RemotePath must be specified' }
     if (!$RemotePath.StartsWith('/')) { throw 'RemotePath must start with /' }
-    if ($File.PSIsContainer) { "$($File.FullName) is not a file" }
-    if ($RemotePath.EndsWith('/')) { $key = $RemotePath + $File.Name }
+    if ($f.PSIsContainer) { "$($f.FullName) is not a file" }
+    if ($RemotePath.EndsWith('/')) { $key = $RemotePath + $f.Name }
     else { $key = $RemotePath }
     
-    $fs = [System.IO.File]::OpenRead($File.FullName)
-    Write-Host "Copying $($File.FullName) to $key"
-    Put-FromStream -Key $key -Perm $Perm -ContentType (InferMimeType -Extension $File.Extension) -Length $File.Length -Stream $fs
+    $fs = [System.IO.File]::OpenRead($f.FullName)
+    Write-Host "Copying $($f.FullName) to $key"
+    Put-FromStream -Key $key -Perm $Perm -ContentType (InferMimeType -Extension $f.Extension) -Length $f.Length -Stream $fs
 }
 
-function Put-Folder([System.IO.FileSystemInfo]$Folder, [string]$RemotePath, [string]$Perm='private') {
-    if (!$Folder.PSIsContainer) { throw "$($Folder.FullName) is not a folder"}
+function Put-FolderAsPrefix([string]$Folder, [string]$RemotePath, [string]$Perm='private') {
+    $f = Get-Item $Folder
+    if (!$f.PSIsContainer) { throw "$($f.FullName) is not a folder"}
     if (!$RemotePath) { throw 'RemotePath must be specified' }
     if (!$RemotePath.StartsWith('/')) { throw 'RemotePath must start with /' }
     if ($RemotePath -ne '/') { $RemotePath = $RemotePath.TrimEnd('/') }
 
-    Get-ChildItem $Folder -Recurse | ? { !$_.PSIsContainer } | % {
+    Get-ChildItem $f -Recurse | ? { !$_.PSIsContainer } | % {
         if ($RemotePath -eq '/') {
-            $key = $_.FullName.Replace($Folder.FullName, '').Replace('\', '/')
+            $key = $_.FullName.Replace($f.FullName, '').Replace('\', '/')
         } else {
-            $key = $RemotePath  + $_.FullName.Replace($Folder.FullName, '').Replace('\', '/')
+            $key = $RemotePath  + $_.FullName.Replace($f.FullName, '').Replace('\', '/')
         }
         $fs = [System.IO.File]::OpenRead($_.FullName)
         Write-Host "Copying $($_.FullName) to $key"
@@ -68,7 +69,7 @@ function Put-Folder([System.IO.FileSystemInfo]$Folder, [string]$RemotePath, [str
     }
 }
 
-function Get-File([string]$RemotePath, [string]$Folder='.') {
+function Get-KeyToFile([string]$RemotePath, [string]$Folder='.') {
     if (!$RemotePath) { throw 'RemotePath must be specified' }
     if (!$RemotePath.StartsWith('/')) { throw 'RemotePath must start with a /' }
     if ($RemotePath.EndsWith('/')) { throw 'RemotePath must be a file, not a folder (must not end with a /)' }
@@ -80,7 +81,7 @@ function Get-File([string]$RemotePath, [string]$Folder='.') {
     Get-ToStream -Key $RemotePath -Stream $fs
 }
 
-function Get-Folder([string]$RemotePath, [string]$Folder='.') {
+function Get-PrefixToFile([string]$RemotePath, [string]$Folder='.') {
     if (!$RemotePath) { throw 'RemotePath must be specified' }
     if (!$RemotePath.StartsWith('/')) { throw 'RemotePath must start with a /' }
     if ($RemotePath -ne '/' -and !$RemotePath.EndsWith('/')) { throw 'RemotePath must be a folder (must end with a /)' }
@@ -92,9 +93,17 @@ function Get-Folder([string]$RemotePath, [string]$Folder='.') {
             $localBase = $f.FullName.TrimEnd('\')
             $localPath = $localBase + '\' + ($_.Key -replace "^$RemotePath").Replace('/', '\')
             $parent = Split-Path $localPath
-            try { Get-Item $parent } catch {
+            try {
+                $p = Get-Item $parent
+                if (!$p.PSIsContainer) {
+                    Remove-Item $p -Force
+                    [void](New-Item $parent -ItemType 'Directory')
+                }
+            } catch {
                 if ($_.Exception.Message -match 'it does not exist') {
                     [void](New-Item $parent -ItemType 'Directory')
+                } else {
+                    throw $_
                 }
             }
             write-host ('Copying ' + $_.Key + ' to ' + $localPath)
@@ -104,31 +113,16 @@ function Get-Folder([string]$RemotePath, [string]$Folder='.') {
         if ($l.IsTruncated) { $marker = $l.NextMarker }
     } while ($l.IsTruncated) 
 }
-function Get-ToFile([System.IO.FileSystemInfo]$LocalFolder) {
-    Begin {
-        if (!$LocalFolder.PSIsContainer) { throw 'LocalFolder must be a folder' }
-        $firstItem = $true
-    }
-    Process {
-        [string]$key = $_
-        if (!$key.StartsWith('/')) { $key = '/' + $key }
-        if (!$key.EndsWith('/')) {
-            if ($firstItem) { $base = (Split-Path $key).Replace('\', '/'); $firstItem = $false }
-            $targetPath = $LocalFolder.FullName + '\' + ($key -replace "^$base").Replace('/', '\').TrimStart('\')
-            Write-Host "Copying $key to $targetPath"
-        }
-    }
-}
-
 function Get-Dir([string]$Path, [switch]$Recurse) {
     if (!$Path) { throw 'Path must be specified' }
     if (!$Path.StartsWith('/')) { throw 'Path must start with a /' }
     if ($Path -ne '/' -and !$Path.EndsWith('/')) { $Path += '/' }
+    if ($Path -eq '/') { $Path = '' }
     do {
         if (!$Recurse) { $delimiter = '/' }
         $l = List-Keys -prefix $Path -delimiter $delimiter -marker $marker
         $l.Contents | % { [PSCustomObject]@{
-                Name = $_.Key
+                Name = '/' + $_.Key.TrimStart('/')
                 Size = $_.Size
                 ETag = $_.ETag
                 LastModified = $_.LastModified
@@ -136,7 +130,7 @@ function Get-Dir([string]$Path, [switch]$Recurse) {
            }
         }
         $l.CommonPrefixes | % { [PSCustomObject]@{
-            Name = $_
+            Name = '/' + $_.TrimEnd('/').TrimStart('/')
             Size = 0
             ETag = $null
             LastModified = $null
@@ -149,10 +143,10 @@ function Get-Dir([string]$Path, [switch]$Recurse) {
 
 # Initialize the module
 #Laptop
-#Get-Bucket -EndPoint 'http://localhost:9000' -BucketName 'test' -AccessKey '4OSXWF5MAL6BUKJE9C72' -SecretKey 'bGkzkk9cqtCztyP1pDVARCskzzg6fwnqtz7m7xsU'
+Get-Bucket -EndPoint 'http://localhost:9000' -BucketName 'test' -AccessKey '4OSXWF5MAL6BUKJE9C72' -SecretKey 'bGkzkk9cqtCztyP1pDVARCskzzg6fwnqtz7m7xsU'
 
 #PC
-Get-Bucket -EndPoint 'http://localhost:9000' -BucketName 'test' -AccessKey '82Z7UVWLMN7K4TMP9RJF' -SecretKey 'b9PbWQoLVCHT1vq1LaE6twQIKUr3y0ArvckDSrr9'
+#Get-Bucket -EndPoint 'http://localhost:9000' -BucketName 'test' -AccessKey '82Z7UVWLMN7K4TMP9RJF' -SecretKey 'b9PbWQoLVCHT1vq1LaE6twQIKUr3y0ArvckDSrr9'
 # List all existing keys (files) on Object Storage
 #Get-Dir / -Recurse | Format-Table
 

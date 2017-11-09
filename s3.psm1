@@ -90,7 +90,7 @@ function Run([string]$method, [string]$uri, [hashtable]$headers, [hashtable]$par
     $url = $bucket.EP + $uri
     if ($paramStr) { $url += '?' + $paramStr.TrimEnd('&') }
 
-    write-host $url
+    #write-host $url
 
     [System.Net.HttpWebRequest]$wr = [System.Net.WebRequest]::Create($url)
     $wr.Method = $method
